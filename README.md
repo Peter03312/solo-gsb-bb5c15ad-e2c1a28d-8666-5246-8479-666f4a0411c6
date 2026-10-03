@@ -88,6 +88,15 @@
     `?terminal_id=...&package_no=...` 为详情）或路径形式
     `GET /field-packages/{terminal_id}/{package_no}`（终端/包号含 `/` 时用查询参数形式），
     含内容指纹与首次响应，不存在返回 404 `FIELD_PACKAGE_NOT_FOUND`。
+- **成果包交付前复核（只读）**：`POST /packages/{id}/reconcile` 输入成果包编号（路径）
+  与预期当前正式修订号 `expected_revision`（请求体），在**同一只读快照视图**中逐项比较
+  包内每个地层对的**封存关系结论、最优证据路径与当前正式结果**，分类为
+  `conclusion_changed`（结论改变）/ `path_only_changed`（仅路径改变）/
+  `identical`（完全一致）；当前结果由**全部生效断言**推导，**途经未入选地层的证据仍
+  参与当前推导**，未定关系路径为空。同时给出每对**自封存修订后首次偏离封存结果**的
+  正式修订号与变化来源（`first_deviation`，含修订后关系/路径与上一状态），**即使后来
+  已恢复一致也保留曾偏离记录**，从未偏离为 `null`。包不存在（404 `PACKAGE_NOT_FOUND`）
+  或预期号过期（409 `STALE_REVISION`）明确拒绝；核对不改写成果包、断言或修订。
 - **已汇入整包勘误替换**：`POST /field-packages/corrections` 对已成功汇入的整包整包勘误。
   接收**原终端号、原包号、新包号、预期正式修订号**，以及新包的**站点、短号对照和带序号断言**：
   - **新包号须未使用且不同于原包号**（400 `FIELD_CORRECTION_SAME_PACKAGE`、
@@ -169,6 +178,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/projections/{id}/merge` | 并入：净变更应用于最新正式状态并重新核验 |
 | DELETE | `/projections/{id}` | 放弃推演（仅 open 可放弃） |
 | POST | `/packages` | 封存专题成果包：把定版中的一组地层关系冻结为可转交复核包 `{version, strata[]}` |
+| POST | `/packages/{id}/reconcile` | 成果包交付前只读复核：逐对比较封存关系/最优路径与当前结果（结论改变/仅路径改变/完全一致），附首次偏离修订号与来源 |
 | GET | `/packages` / `/packages/{id}` | 成果包列表 / 成果包详情（冻结内容与内容指纹） |
 
 ### 批次请求格式
@@ -1084,6 +1094,111 @@ curl -X POST "$BASE/packages" -H 'Content-Type: application/json' \
 bash examples/packages_demo.sh
 ```
 
+## 成果包交付前复核（只读）
+
+成果包封存后，正式断言可能经历撤回、新增与多次定版。交付前复核人员需要回答两个问题：
+**封存结论现在能否沿用**？**若曾偏离，是从哪个修订开始、由什么操作引起**？
+`POST /packages/{package_id}/reconcile` 在**同一 `REPEATABLE READ READ ONLY` 快照事务**
+内完成全部读取，包、修订号、当前生效断言与变化台账取自同一视图，不输出混合版本数据。
+
+请求体只携带预期的当前正式修订号（包编号在路径中）：
+
+```json
+{"expected_revision": 4}
+```
+
+**逐对比较口径**
+
+- 封存侧直接取包内冻结内容（`sealed`：封存关系与封存最优路径；未定封存路径按 `[]`）；
+- 当前侧（`current`）由**当前全部生效断言**重新推导，**不按包入选集合裁剪证据图**：
+  路径途经未入选地层的证据同样参与推导（与 `/relationship` 同一推导引擎，最少证据数、
+  并列证据编号序列字典序最小），并附当前 `path_detail`（逐步当前生效断言，含 `status`）；
+  当前未定时 `evidence_path` 为 `[]`；
+- 分类（每对恰好一类）：
+
+| `comparison` | 含义 |
+| --- | --- |
+| `conclusion_changed` | 封存关系与当前关系不同（同一期 / 早于 / 晚于 / 未定之间变化） |
+| `path_only_changed` | 关系一致，但最优证据路径不同 |
+| `identical` | 关系与路径都与封存一致 |
+
+**首次偏离（`first_deviation`）**
+
+- 在 `/revision-changes` 台账中扫描**封存修订（`snapshot_revision`）之后**该对
+  （按地层编号固定顺序）的记录，取第一条**修订后状态（new_relation/new_path）与封存
+  结果不一致**的记录：结论偏离或仅路径偏离都算；
+- **已恢复一致也保留**：即使当前 `comparison=identical`，历史上首次偏离的修订号、
+  来源（`formal_batch` / `projection_merge` / `field_package` /
+  `field_package_correction`）、当时修订后的关系/路径与上一状态仍完整给出；
+  从未偏离为 `null`；
+- 零变化修订（如撤回从未进入最优路径的平行断言）本就不产生台账行，不会误判为偏离。
+
+响应示例（包 1 封存于修订 1；修订 2 路径改变，修订 3 结论改变，修订 4 恢复）：
+
+```json
+{
+  "package_id": 1,
+  "version": 1,
+  "snapshot_revision": 1,
+  "label": "二期定版",
+  "strata": ["L1", "L5", "L6"],
+  "transit_strata": ["L2", "L3", "L4"],
+  "content_hash": "5d58a936…",
+  "expected_revision": 4,
+  "current_revision": 4,
+  "revision": 4,
+  "summary": {
+    "total_pairs": 3,
+    "conclusion_changed": 0,
+    "path_only_changed": 0,
+    "identical": 3,
+    "ever_deviated": 3
+  },
+  "pairs": [
+    {
+      "stratum_a": "L1",
+      "stratum_b": "L5",
+      "comparison": "identical",
+      "comparison_label": "完全一致",
+      "sealed": {"relation": "earlier_than", "relation_label": "早于",
+                 "evidence_path": ["RV-001", "RV-002", "RV-003", "RV-004"]},
+      "current": {"relation": "earlier_than", "relation_label": "早于",
+                  "evidence_path": ["RV-001", "RV-002", "RV-003", "RV-004"],
+                  "path_detail": [ ]},
+      "first_deviation": {
+        "revision": 2,
+        "source": "formal_batch",
+        "source_label": "正式断言批次",
+        "previous_relation": "earlier_than",
+        "relation": "earlier_than",
+        "previous_evidence_path": ["RV-001", "RV-002", "RV-003", "RV-004"],
+        "evidence_path": ["RV-010"]
+      }
+    }
+  ]
+}
+```
+
+调用：
+
+```bash
+curl -s -X POST "$BASE/packages/1/reconcile" \
+  -H 'Content-Type: application/json' -d '{"expected_revision": 4}'
+```
+
+- 预期号与当前不一致：**HTTP 409 `STALE_REVISION`**，`details.current_revision` 给当前号，
+  不输出任何比较结果（取当前号后重查）；
+- 成果包不存在：**HTTP 404 `PACKAGE_NOT_FOUND`**；
+- `expected_revision` 缺失 / 为负：HTTP 422（请求体校验）；
+- 核对**只读**：不写库、不递增修订号、不产生变化记录，成果包内容指纹、断言状态均不变。
+
+完整端到端演示（完全一致 / 仅路径改变 / 结论改变、恢复一致后保留曾偏离、
+四类变化来源、过期与不存在拒绝、只读校验）：
+
+```bash
+bash examples/package_reconciliation_demo.sh
+```
+
 ## 调用示例
 
 端到端 curl 演示（覆盖登记、批次、推导查询、冲突拒绝、撤回、定版与旧版不可变）：
@@ -1142,6 +1257,13 @@ bash examples/changes_demo.sh
 bash examples/packages_demo.sh
 ```
 
+成果包交付前复核演示（逐对结论改变 / 仅路径改变 / 完全一致、首次偏离修订号
+与四类变化来源、恢复一致仍保留曾偏离、包不存在与过期修订拒绝、核对全程只读）：
+
+```bash
+bash examples/package_reconciliation_demo.sh
+```
+
 野外终端离线整包汇入演示（短号随包建层与跨包绑定、稳定证据编号、整包核验附冲突路径、
 同包同内容幂等返回原结果 / 异内容拒绝、未知短号 / 重复序号 / 站点冲突 / 改绑 /
 过期修订明确报错）：
@@ -1175,6 +1297,7 @@ app/
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
   packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
+  reconciliation.py # 成果包交付前只读复核：封存结论/最优路径与当前结果逐项比较、首次偏离追溯
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
   arrangement.py   # 分期试排（只读）：总期数+锚点约束下每组在所有可行排布中的最早/最晚期位
@@ -1191,6 +1314,7 @@ examples/
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
   packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）
+  package_reconciliation_demo.sh # 成果包交付前复核示例（三类比较/首次偏离/曾偏离保留/只读拒绝）
   field_packages_demo.sh # 野外终端离线整包汇入示例（短号绑定/稳定编号/整批核验/幂等/拒绝分支）
   field_package_corrections_demo.sh # 已汇入整包勘误示例（撤回+新包单事务/幂等/替换链/台账/冲突回滚/历史可查）
   client_demo.py    # Python 客户端示例

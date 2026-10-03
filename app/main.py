@@ -5,10 +5,10 @@ from typing import Optional
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import arrangement as arrangement_svc, changes, db, field as field_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, resilience, service
+from . import arrangement as arrangement_svc, changes, db, field as field_svc, packages as packages_svc, periodization as periodization_svc, preflight as preflight_svc, projections, reconciliation, resilience, service
 from .derivation import RELATION_LABELS
 from .errors import ApiError
-from .models import ArrangementIn, BatchIn, FieldPackageCorrectionIn, FieldPackageIn, PackageIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
+from .models import ArrangementIn, BatchIn, FieldPackageCorrectionIn, FieldPackageIn, PackageIn, PackageReconcileIn, PreflightIn, ProjectionBatchIn, ProjectionIn, ResilienceIn, SnapshotIn, StratumIn
 
 
 @asynccontextmanager
@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -42,7 +42,11 @@ app = FastAPI(
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
-        "支持把定版中的一组地层封存为不可变、可转交复核的专题成果包（/packages）。"
+        "支持把定版中的一组地层封存为不可变、可转交复核的专题成果包（/packages）；"
+        "支持成果包交付前只读复核（POST /packages/{id}/reconcile）："
+        "在同一只读快照视图中逐项比较包内封存关系结论与最优证据路径和当前正式结果"
+        "（结论改变 / 仅路径改变 / 完全一致），并给出每对自封存修订后首次偏离的"
+        "修订号与变化来源（已恢复一致也保留曾偏离记录），不改写成果包、断言或修订。"
     ),
     lifespan=lifespan,
 )
@@ -440,6 +444,26 @@ def list_packages():
 def get_package(package_id: int):
     """成果包详情：冻结的两两关系、路径断言、途经未入选地层与内容指纹。"""
     return packages_svc.get_package(package_id)
+
+
+@app.post("/packages/{package_id}/reconcile", tags=["packages"])
+def post_package_reconcile(package_id: int, body: PackageReconcileIn):
+    """成果包交付前复核（只读，不写库、不递增修订号、不改成果包/断言/变化记录）。
+
+    在请求体 expected_revision 对应的**同一正式视图**中，对包内每个地层对：
+
+    - 比较封存关系结论 / 最优证据路径与当前正式结果，分类为
+      `conclusion_changed`（结论改变）/ `path_only_changed`（仅路径改变）/
+      `identical`（完全一致）；当前结果由全部生效断言推导，途经未入选地层的
+      证据仍参与；未定路径为空；
+    - 给出**自封存修订之后首次偏离封存结果**的正式修订号与来源
+      （formal_batch / projection_merge / field_package /
+      field_package_correction），已恢复一致也保留曾偏离记录，从未偏离为 null。
+
+    成果包不存在 404 PACKAGE_NOT_FOUND；预期号过期 409 STALE_REVISION
+    （details.current_revision）；全程在 REPEATABLE READ READ ONLY 快照事务内完成。
+    """
+    return reconciliation.reconcile_package(package_id, body)
 
 
 # ------------------------------------------------------------------ 推演（证据修订沙盘）

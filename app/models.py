@@ -76,6 +76,19 @@ class PackageIn(BaseModel):
     strata: List[str] = Field(description="已登记地层编号；至少两个且不重复（顺序不影响结果，自动排序去重）")
 
 
+class PackageReconcileIn(BaseModel):
+    """成果包交付前复核请求（只读，不写库、不递增修订号、不改成果包/断言/修订）。
+
+    成果包编号取自路径（POST /packages/{package_id}/reconcile），请求体只携带
+    预期的当前正式修订号。在该修订号对应的同一正式视图中，逐项比较包内封存
+    关系结论与最优证据路径和当前正式结果（结论改变 / 仅路径改变 / 完全一致），
+    并给出每对自封存修订后首次偏离封存结果的修订号与变化来源（已恢复一致也
+    保留）。expected_revision 过期按 STALE_REVISION 拒绝。
+    """
+
+    expected_revision: int = Field(ge=0, description="预期的当前正式修订号；过期按 STALE_REVISION 拒绝")
+
+
 class ProjectionBatchIn(BaseModel):
     """推演内的一批断言变更。须携带该推演当前修订号（自 0 起，批次成功后递增）；
     语义与正式批次一致：整批按应用后的最终关系核验，任一冲突则整批拒绝、推演状态不变。"""
