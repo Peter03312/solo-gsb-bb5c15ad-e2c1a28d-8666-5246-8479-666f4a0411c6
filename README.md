@@ -170,6 +170,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | DELETE | `/projections/{id}` | 放弃推演（仅 open 可放弃） |
 | POST | `/packages` | 封存专题成果包：把定版中的一组地层关系冻结为可转交复核包 `{version, strata[]}` |
 | GET | `/packages` / `/packages/{id}` | 成果包列表 / 成果包详情（冻结内容与内容指纹） |
+| GET | `/packages/{id}/review?expected_revision=N` | 交付前只读复核：逐对比较封存关系、最优证据路径与当前结果，并追溯首次偏离修订 |
 
 ### 批次请求格式
 
@@ -1078,10 +1079,106 @@ curl -X POST "$BASE/packages" -H 'Content-Type: application/json' \
 - 列表 `GET /packages` 只给摘要（不含 `pairs` 明细）；
   详情 `GET /packages/{id}` 返回完整冻结内容，不存在返回 404 `PACKAGE_NOT_FOUND`。
 
+### 交付前复核：`GET /packages/{id}/review`（只读）
+
+成果包转交前，复核人员可携带**预期正式修订号**比较包内封存结果与当前正式视图：
+
+```bash
+curl "$BASE/packages/1/review?expected_revision=3"
+```
+
+- 请求必须给出 `expected_revision`；与当前正式修订号不一致时返回 409
+  `STALE_REVISION`（`details.current_revision`），不输出混合版本；包不存在返回
+  404 `PACKAGE_NOT_FOUND`。
+- 整个核对在同一个 `REPEATABLE READ READ ONLY` 快照事务内完成；不递增修订号，
+  不产生变化记录，不改写成果包、断言、定版或任何其他数据。
+- `pairs[]` 与成果包使用相同的地层对顺序，每对并列给出 `sealed` 与 `current`：
+  关系结论、中文标签、`evidence_path`、逐步 `path_detail`；未定关系的路径恒为
+  空数组 `[]`。
+- 当前推导使用**当前全部生效断言**，不按成果包入选集合裁剪；途经未入选地层的
+  证据仍参与推导，逐步断言继续带 `in_selection`，当前路径新途经的未入选地层汇总
+  在顶层 `current_transit_strata`。
+- 每对 `status` 区分：
+
+| status | 含义 |
+| --- | --- |
+| `conclusion_changed` | 封存关系结论与当前不同（含确定 ↔ 未定、早于方向变化、同一期 ↔ 先后） |
+| `path_only_changed` | 关系结论相同，但最优证据路径不同 |
+| `identical` | 关系结论与最优证据路径完全一致 |
+
+- `first_deviation` 是该对**自成果包封存修订之后**首次偏离封存结果的正式修订：
+  包含 `revision`、`source` / `source_label`、偏离前后关系和路径。来源可为
+  `formal_batch`（正式断言批次）、`projection_merge`（推演并入）、
+  `field_package`（野外整包汇入）、`field_package_correction`（野外整包勘误）。
+  即使当前已经恢复到封存结论或路径，也保留曾偏离记录；从未偏离时为 `null`。
+- 顶层 `summary` 返回总对数、三类计数，以及 `ever_deviated`（历史上曾偏离，
+  包含已恢复一致）的对数。
+
+响应示例（字段经过省略）：
+
+```json
+{
+  "package": {
+    "id": 1,
+    "version": 1,
+    "snapshot_revision": 1,
+    "label": "二期定版",
+    "strata": ["L1", "L5", "L6"],
+    "content_hash": "..."
+  },
+  "expected_revision": 3,
+  "current_revision": 3,
+  "revision": 3,
+  "derivation_scope": "all_active_assertions",
+  "summary": {
+    "total_pairs": 3,
+    "conclusion_changed": 1,
+    "path_only_changed": 1,
+    "identical": 1,
+    "ever_deviated": 2
+  },
+  "current_transit_strata": ["L2"],
+  "pairs": [
+    {
+      "stratum_a": "L1",
+      "stratum_b": "L5",
+      "status": "identical",
+      "status_label": "完全一致",
+      "sealed": {
+        "relation": "earlier_than",
+        "evidence_path": ["EV-001", "EV-002"],
+        "path_detail": []
+      },
+      "current": {
+        "relation": "earlier_than",
+        "evidence_path": ["EV-001", "EV-002"],
+        "path_detail": []
+      },
+      "first_deviation": {
+        "revision": 2,
+        "source": "formal_batch",
+        "source_label": "正式断言批次",
+        "from_relation": "earlier_than",
+        "to_relation": "undetermined",
+        "from_evidence_path": ["EV-001", "EV-002"],
+        "to_evidence_path": []
+      }
+    }
+  ]
+}
+```
+
 完整端到端演示（封存、乱序幂等、未定无路径、撤回 + 新定版后内容不变、各类拒绝）：
 
 ```bash
 bash examples/packages_demo.sh
+```
+
+交付前复核演示（结论改变、仅路径改变、完全一致、恢复后保留首次偏离记录、
+过期修订号与不存在包拒绝；全程只读）：
+
+```bash
+bash examples/package_review_demo.sh
 ```
 
 ## 调用示例
@@ -1174,7 +1271,7 @@ app/
   field.py        # 野外终端离线整包汇入与勘误替换：短号建层/跨包绑定、稳定证据编号、整批核验、包台账幂等、撤回替换链
   preflight.py    # 提交前只读预检：求消除本批冲突所需撤回的最少生效旧证据（预算 0～3）
   resilience.py   # 证据撤回承受力（只读）：混合证据图最小割求让两层关系变未定的最少撤回（含受保护集合）
-  packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）
+  packages.py     # 专题成果包：定版地层关系封存（冻结、集合幂等、不可变、可转交复核）与交付前只读复核
   projections.py  # 推演（沙盘）：创建固定基线、推演批次、关系查询、并入核验
   periodization.py # 分期骨架视图（只读）：同一期等价组、组间传递约简直接早于边
   arrangement.py   # 分期试排（只读）：总期数+锚点约束下每组在所有可行排布中的最早/最晚期位
@@ -1191,6 +1288,7 @@ examples/
   projection_demo.sh # 推演端到端示例（沙盘批次、并入成功与三类失败、空净变更）
   changes_demo.sh  # 修订变化追踪示例（变化/路径改变/失败批次/并入/游标分页）
   packages_demo.sh # 专题成果包示例（封存/幂等/不可变/拒绝分支）
+  package_review_demo.sh # 成果包交付前复核示例（三类比较/首次偏离/恢复留痕/拒绝分支）
   field_packages_demo.sh # 野外终端离线整包汇入示例（短号绑定/稳定编号/整批核验/幂等/拒绝分支）
   field_package_corrections_demo.sh # 已汇入整包勘误示例（撤回+新包单事务/幂等/替换链/台账/冲突回滚/历史可查）
   client_demo.py    # Python 客户端示例

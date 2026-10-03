@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="考古地层关系核验服务",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "登记遗址地层与带唯一证据编号的“同一期 / 早于”断言；"
         "同一期可传递，早于沿同一期与早于路径推导；"
@@ -42,7 +42,8 @@ app = FastAPI(
         "支持推演（沙盘）：固定基线修订号与断言，推演内独立批次核验，"
         "并入时把相对基线的净变更应用于最新正式状态并重新核验；"
         "支持按正式修订游标分页追踪关系结论及最优支撑路径的变化（/revision-changes）；"
-        "支持把定版中的一组地层封存为不可变、可转交复核的专题成果包（/packages）。"
+        "支持把定版中的一组地层封存为不可变、可转交复核的专题成果包（/packages），"
+        "并在交付前只读复核封存结论与当前正式视图是否一致（/packages/{id}/review）。"
     ),
     lifespan=lifespan,
 )
@@ -440,6 +441,27 @@ def list_packages():
 def get_package(package_id: int):
     """成果包详情：冻结的两两关系、路径断言、途经未入选地层与内容指纹。"""
     return packages_svc.get_package(package_id)
+
+
+@app.get("/packages/{package_id}/review", tags=["packages"])
+def review_package(
+    package_id: int,
+    expected_revision: int = Query(
+        ge=0, description="预期的当前正式修订号；与当前不一致返回 409 STALE_REVISION（含当前修订号）"
+    ),
+):
+    """成果包交付前只读复核：逐对比较封存结论/最优路径与当前正式视图。
+
+    - 同一 REPEATABLE READ 只读快照内核对修订号、读取包、当前全部生效断言与修订历史；
+    - `status`：`conclusion_changed`（结论改变）、`path_only_changed`（仅最优路径改变）、
+      `identical`（结论与路径完全一致）；未定关系路径为空数组；
+    - 当前推导使用全部生效断言，路径途经未入选地层的证据仍参与推导；
+    - `first_deviation` 给出该对自封存修订之后首次偏离封存结果的修订号、变化来源及
+      当时路径；后来恢复一致也保留该记录；从未偏离为 null；
+    - 包不存在返回 404 PACKAGE_NOT_FOUND；预期修订号过期返回 409 STALE_REVISION；
+      全程只读，不改写成果包、断言或修订。
+    """
+    return packages_svc.review_package(package_id, expected_revision)
 
 
 # ------------------------------------------------------------------ 推演（证据修订沙盘）
